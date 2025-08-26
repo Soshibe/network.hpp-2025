@@ -101,7 +101,11 @@ protected:
     SOCKET udpSocket_, tcpSocket_;
     std::thread udpThread_, tcpThread_, tickThread_;
 
-    struct Peer { sockaddr_in addr; SOCKET socket = INVALID_SOCKET; };
+    struct Peer { 
+        sockaddr_in addr; 
+        SOCKET socket = INVALID_SOCKET; 
+        bool isTCP = false;  
+    };
     std::mutex peersMutex_;
     std::unordered_map<std::string, Peer> peers_;
 
@@ -144,7 +148,7 @@ private:
             std::lock_guard<std::mutex> lock(peersMutex_);
             for (auto& pkt : sendUDP) {
                 for (auto& [key, peer] : peers_) {
-                    if (peer.socket != INVALID_SOCKET && !pkt.isTCP) {
+                    if (!peer.isTCP && peer.socket != INVALID_SOCKET && !pkt.isTCP) {
                         sendto(peer.socket, pkt.serialize().c_str(), (int)pkt.serialize().size(), 0,
                             (sockaddr*)&peer.addr, sizeof(peer.addr));
                     }
@@ -164,7 +168,7 @@ private:
             std::lock_guard<std::mutex> lock(peersMutex_);
             for (auto& pkt : sendTCP) {
                 for (auto& [key, peer] : peers_) {
-                    if (peer.socket != INVALID_SOCKET && pkt.isTCP) {
+                    if (peer.isTCP && peer.socket != INVALID_SOCKET && pkt.isTCP) {
                         send(peer.socket, pkt.serialize().c_str(), (int)pkt.serialize().size(), 0);
                     }
                 }
@@ -201,6 +205,7 @@ inline void TwentyFiveNetwork::startUDP() {
             if (bytes > 0) {
                 Packet pkt;
                 if (Packet::deserialize(std::string(buf, bytes), pkt)) {
+                    pkt.isTCP = false;
                     std::lock_guard<std::mutex> lock(packetMutexUDP_);
                     packetBufferUDP_.push_back(pkt);
 
@@ -252,7 +257,7 @@ inline void TwentyFiveNetwork::startTCP() {
                 getpeername(clientSock, (sockaddr*)&addr, &len);
                 std::string key = addrToKey(addr);
                 std::lock_guard<std::mutex> lock(peersMutex_);
-                peers_[key] = Peer{ addr, clientSock };
+                peers_[key] = Peer{ addr, clientSock, true };
 
                 std::thread([this, clientSock, key] {
                     char buf[1024];
@@ -261,6 +266,7 @@ inline void TwentyFiveNetwork::startTCP() {
                         if (bytes > 0) {
                             Packet pkt;
                             if (Packet::deserialize(std::string(buf, bytes), pkt)) {
+                                pkt.isTCP = true;
                                 std::lock_guard<std::mutex> lock(packetMutexTCP_);
                                 packetBufferTCP_.push_back(pkt);
                             }
@@ -315,7 +321,7 @@ inline bool TwentyFiveNetwork::TCPConnect(const std::string& ipAddress, int serv
     if (connect(sock, (sockaddr*)&server, sizeof(server)) == SOCKET_ERROR)
         return false;
 
-    Peer p; p.addr = server; p.socket = sock;
+    Peer p; p.addr = server; p.socket = sock; p.isTCP = true;
     std::lock_guard<std::mutex> lock(peersMutex_);
     peers_[ipAddress + ":" + std::to_string(serverPort)] = p;
     return true;
