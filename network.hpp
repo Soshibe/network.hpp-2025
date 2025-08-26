@@ -46,6 +46,7 @@ public:
             return out;
         }
 
+        // Existing deserialize for std::string (kept for compatibility)
         static bool deserialize(const std::string& raw, Packet& out) {
             size_t sep1 = raw.find('|');
             size_t sep2 = raw.find('|', sep1 + 1);
@@ -54,6 +55,25 @@ public:
                 out.objectId = std::stoull(raw.substr(0, sep1));
                 out.varName = raw.substr(sep1 + 1, sep2 - sep1 - 1);
                 out.data.assign(raw.begin() + sep2 + 1, raw.end());
+                return true;
+            }
+            catch (...) { return false; }
+        }
+
+        // Optimized deserialize for a raw buffer
+        static bool deserialize(const char* raw, size_t size, Packet& out, size_t& consumed) {
+            std::string temp(raw, size);
+            size_t sep1 = temp.find('|');
+            if (sep1 == std::string::npos) return false;
+
+            size_t sep2 = temp.find('|', sep1 + 1);
+            if (sep2 == std::string::npos) return false;
+
+            try {
+                out.objectId = std::stoull(temp.substr(0, sep1));
+                out.varName = temp.substr(sep1 + 1, sep2 - sep1 - 1);
+                out.data.assign(temp.begin() + sep2 + 1, temp.end());
+                consumed = sep2 + 1 + out.data.size();
                 return true;
             }
             catch (...) { return false; }
@@ -101,17 +121,17 @@ protected:
     SOCKET udpSocket_, tcpSocket_;
     std::thread udpThread_, tcpThread_, tickThread_;
 
-    struct Peer { 
-        sockaddr_in addr; 
-        SOCKET socket = INVALID_SOCKET; 
-        bool isTCP = false;  
+    struct Peer {
+        sockaddr_in addr;
+        SOCKET socket = INVALID_SOCKET;
+        bool isTCP = false;
     };
     std::mutex peersMutex_;
     std::unordered_map<std::string, Peer> peers_;
 
     std::mutex packetMutexUDP_, packetMutexTCP_;
     std::vector<Packet> packetBufferUDP_, packetBufferTCP_;
-
+    
     virtual void WhenReceiveUDP(std::vector<Packet>& packets) {}
     virtual void WhenReceiveTCP(std::vector<Packet>& packets) {}
     virtual void onUDPTick() {}
@@ -178,6 +198,64 @@ private:
 
         onUDPTick(); onTCPTick();
     }
+
+    // --- REFACTORED MEMBERS ---
+    // A single, reusable buffer and packet for the UDP listener.
+    // This is safe because only one thread uses it.
+    char udpBuf[1024];
+    Packet udpPkt;
+
+    // A ring buffer implementation to avoid reallocations.
+    struct RingBuffer {
+        std::vector<char> buffer;
+        size_t write_idx = 0;
+        size_t read_idx = 0;
+
+        RingBuffer(size_t size) : buffer(size) {}
+
+        size_t write(const char* data, size_t size) {
+            size_t available_space = buffer.size() - (write_idx - read_idx);
+            if (size > available_space) return 0;
+
+            for (size_t i = 0; i < size; ++i) {
+                buffer[(write_idx + i) % buffer.size()] = data[i];
+            }
+            write_idx += size;
+            return size;
+        }
+
+        size_t peek(char* out, size_t size) const {
+            if (size > write_idx - read_idx) return 0;
+
+            for (size_t i = 0; i < size; ++i) {
+                out[i] = buffer[(read_idx + i) % buffer.size()];
+            }
+            return size;
+        }
+
+        void advance(size_t size) {
+            if (size <= write_idx - read_idx) {
+                read_idx += size;
+            }
+        }
+
+        size_t size() const {
+            return write_idx - read_idx;
+        }
+    };
+
+    // A struct to hold per-connection data for TCP.
+    struct TcpConnectionData {
+        char buf[1024]; // Used only for recv, data is then moved to ring buffer
+        Packet pkt;
+        RingBuffer ringBuffer{ 4096 }; // A sufficiently large ring buffer
+    };
+
+    // A map to store a unique buffer and packet for each TCP client.
+    // This is crucial for thread safety, as each client thread gets its own data.
+    std::unordered_map<SOCKET, TcpConnectionData> tcpConnections;
+    std::mutex tcpConnectionsMutex_;
+    // -------------------------
 };
 
 // ---------------------- startUDP ----------------------
@@ -196,21 +274,21 @@ inline void TwentyFiveNetwork::startUDP() {
 
     makeNonBlocking(udpSocket_);
     running_ = true;
-
     udpThread_ = std::thread([this] {
-        char buf[1024];
         sockaddr_in from; int len = sizeof(from);
         while (running_) {
-            int bytes = recvfrom(udpSocket_, buf, sizeof(buf), 0, (sockaddr*)&from, &len);
+            // Use the member buffer directly
+            int bytes = recvfrom(udpSocket_, udpBuf, sizeof(udpBuf), 0, (sockaddr*)&from, &len);
             if (bytes > 0) {
-                Packet pkt;
-                if (Packet::deserialize(std::string(buf, bytes), pkt)) {
-                    pkt.isTCP = false;
+                // Deserialize into the member packet object
+                size_t consumed = 0;
+                if (Packet::deserialize(udpBuf, bytes, udpPkt, consumed)) {
+                    udpPkt.isTCP = false;
                     std::lock_guard<std::mutex> lock(packetMutexUDP_);
-                    packetBufferUDP_.push_back(pkt);
+                    packetBufferUDP_.push_back(udpPkt);
 
                     // add unknown peer
-                    std::string key = addrToKey(from);
+                    static std::string key = addrToKey(from);
                     std::lock_guard<std::mutex> lockPeers(peersMutex_);
                     if (peers_.find(key) == peers_.end()) {
                         Peer p; p.addr = from; p.socket = udpSocket_;
@@ -253,30 +331,64 @@ inline void TwentyFiveNetwork::startTCP() {
             SOCKET clientSock = accept(tcpSocket_, nullptr, nullptr);
             if (clientSock != INVALID_SOCKET) {
                 makeNonBlocking(clientSock);
-                sockaddr_in addr{}; int len = sizeof(addr);
-                getpeername(clientSock, (sockaddr*)&addr, &len);
-                std::string key = addrToKey(addr);
-                std::lock_guard<std::mutex> lock(peersMutex_);
-                peers_[key] = Peer{ addr, clientSock, true };
+                sockaddr_in peerAddr{};
+                int len = sizeof(peerAddr);
+                getpeername(clientSock, (sockaddr*)&peerAddr, &len);
+                std::string key = addrToKey(peerAddr);
+
+                // Add a new entry for this connection. The map allocates the buffer and packet.
+                {
+                    std::lock_guard<std::mutex> lock(tcpConnectionsMutex_);
+                    tcpConnections[clientSock] = TcpConnectionData();
+                }
+
+                // Add peer to the shared list
+                std::lock_guard<std::mutex> peersLock(peersMutex_);
+                peers_[key] = Peer{ peerAddr, clientSock, true };
 
                 std::thread([this, clientSock, key] {
-                    char buf[1024];
-                    while (running_) {
-                        int bytes = recv(clientSock, buf, sizeof(buf), 0);
+                    // Get a reference to this connection's data. This must be a new variable
+                    // because the connection data could be erased by another thread.
+                    TcpConnectionData* connData = nullptr;
+                    {
+                        std::lock_guard<std::mutex> lock(tcpConnectionsMutex_);
+                        auto it = tcpConnections.find(clientSock);
+                        if (it != tcpConnections.end()) {
+                            connData = &it->second;
+                        }
+                    }
+
+                    while (running_ && connData) {
+                        int bytes = recv(clientSock, connData->buf, sizeof(connData->buf), 0);
+
                         if (bytes > 0) {
-                            Packet pkt;
-                            if (Packet::deserialize(std::string(buf, bytes), pkt)) {
-                                pkt.isTCP = true;
+                            // Add received data to the ring buffer
+                            connData->ringBuffer.write(connData->buf, bytes);
+
+                            // Process complete packets from the ring buffer
+                            Packet tempPkt;
+                            size_t consumed = 0;
+                            while (Packet::deserialize(connData->ringBuffer.buffer.data() + connData->ringBuffer.read_idx, connData->ringBuffer.size(), tempPkt, consumed)) {
+                                tempPkt.isTCP = true;
                                 std::lock_guard<std::mutex> lock(packetMutexTCP_);
-                                packetBufferTCP_.push_back(pkt);
+                                packetBufferTCP_.push_back(tempPkt);
+                                connData->ringBuffer.advance(consumed);
                             }
                         }
-                        else if (bytes == 0 || WSAGetLastError() != WSAEWOULDBLOCK) break;
+                        else if (bytes == 0 || WSAGetLastError() != WSAEWOULDBLOCK) {
+                            break;
+                        }
                         std::this_thread::sleep_for(std::chrono::milliseconds(1));
                     }
+
                     closesocket(clientSock);
-                    std::lock_guard<std::mutex> lock(peersMutex_);
+
+                    // Clean up resources for this connection
+                    std::lock_guard<std::mutex> peersLock(peersMutex_);
                     peers_.erase(key);
+                    std::lock_guard<std::mutex> dataLock(tcpConnectionsMutex_);
+                    tcpConnections.erase(clientSock);
+
                     }).detach();
             }
             std::this_thread::sleep_for(std::chrono::milliseconds(1));
