@@ -2,6 +2,7 @@
 #include <string>
 #include <vector>
 #include <unordered_map>
+#include <unordered_set>
 #include <mutex>
 #include <thread>
 #include <atomic>
@@ -21,6 +22,7 @@ public:
         int udpPort = 0; // local port for receiving UDP
         int tcpPort = 0; // local port for receiving TCP
         int tickRate = 20;
+        bool whitelisted = 0; // if set, only allow explicitly whitelisted peers
     };
 
     TwentyFiveNetwork(const Config& cfg)
@@ -39,10 +41,15 @@ public:
         std::string varName;
         std::vector<uint8_t> data;
         bool isTCP = false;
+        std::string peerIp; // IP address of the peer who sent the packet
 
         std::string serialize() const {
-            std::string out = std::to_string(objectId) + "|" + varName + "|";
-            out.append(reinterpret_cast<const char*>(data.data()), data.size());
+            std::string payload = std::to_string(objectId) + "|" + varName + "|";
+            payload.append(reinterpret_cast<const char*>(data.data()), data.size());
+            uint32_t len = static_cast<uint32_t>(payload.size());
+            uint32_t netlen = htonl(len);
+            std::string out(reinterpret_cast<const char*>(&netlen), sizeof(netlen));
+            out += payload;
             return out;
         }
 
@@ -87,12 +94,16 @@ public:
         pkt.data.resize(sizeof(T));
         std::memcpy(pkt.data.data(), &value, sizeof(T));
         if (isTCP) {
-            std::lock_guard<std::mutex> lock(packetMutexTCP_);
-            packetBufferTCP_.push_back(pkt);
+            if (packetMutexTCP_.try_lock()) {
+                packetBufferTCP_.push_back(pkt);
+                packetMutexTCP_.unlock();
+            }
         }
         else {
-            std::lock_guard<std::mutex> lock(packetMutexUDP_);
-            packetBufferUDP_.push_back(pkt);
+            if (packetMutexUDP_.try_lock()) {
+                packetBufferUDP_.push_back(pkt);
+                packetMutexUDP_.unlock();
+            }
         }
         return pkt;
     }
@@ -115,6 +126,23 @@ public:
     void setUDPPort(int p) { cfg_.udpPort = p; }
     void setTCPPort(int p) { cfg_.tcpPort = p; }
 
+    void whitelistIp(const std::string& ip) {
+        std::lock_guard<std::mutex> lock(peersMutex_);
+        whitelist_.insert(ip);
+    }
+    void blacklistIp(const std::string& ip) {
+        std::lock_guard<std::mutex> lock(peersMutex_);
+        blacklist_.insert(ip);
+    }
+    void removeWhitelist(const std::string& ip) {
+        std::lock_guard<std::mutex> lock(peersMutex_);
+        whitelist_.erase(ip);
+    }
+    void removeBlacklist(const std::string& ip) {
+        std::lock_guard<std::mutex> lock(peersMutex_);
+        blacklist_.erase(ip);
+    }
+
 protected:
     Config cfg_;
     std::atomic<bool> running_;
@@ -131,7 +159,11 @@ protected:
 
     std::mutex packetMutexUDP_, packetMutexTCP_;
     std::vector<Packet> packetBufferUDP_, packetBufferTCP_;
-    
+
+    // Whitelist/Blacklist containers
+    std::unordered_set<std::string> whitelist_;
+    std::unordered_set<std::string> blacklist_;
+
     virtual void WhenReceiveUDP(std::vector<Packet>& packets) {}
     virtual void WhenReceiveTCP(std::vector<Packet>& packets) {}
     virtual void onUDPTick() {}
@@ -169,13 +201,13 @@ private:
             for (auto& pkt : sendUDP) {
                 for (auto& [key, peer] : peers_) {
                     if (!peer.isTCP && peer.socket != INVALID_SOCKET && !pkt.isTCP) {
-                        sendto(peer.socket, pkt.serialize().c_str(), (int)pkt.serialize().size(), 0,
+                        std::string data = pkt.serialize();
+                        sendto(peer.socket, data.c_str(), (int)data.size(), 0,
                             (sockaddr*)&peer.addr, sizeof(peer.addr));
                     }
                 }
             }
         }
-        if (!sendUDP.empty()) WhenReceiveUDP(sendUDP);
 
         // send TCP
         std::vector<Packet> sendTCP;
@@ -189,12 +221,13 @@ private:
             for (auto& pkt : sendTCP) {
                 for (auto& [key, peer] : peers_) {
                     if (peer.isTCP && peer.socket != INVALID_SOCKET && pkt.isTCP) {
-                        send(peer.socket, pkt.serialize().c_str(), (int)pkt.serialize().size(), 0);
+                        std::string data = pkt.serialize();
+                        send(peer.socket, data.c_str(), (int)data.size(), 0);
                     }
                 }
             }
         }
-        if (!sendTCP.empty()) WhenReceiveTCP(sendTCP);
+        // REMOVED: if (!sendTCP.empty()) WhenReceiveTCP(sendTCP);
 
         onUDPTick(); onTCPTick();
     }
@@ -261,38 +294,70 @@ private:
 // ---------------------- startUDP ----------------------
 inline void TwentyFiveNetwork::startUDP() {
     if (cfg_.udpPort <= 0) return;
-    udpSocket_ = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+    udpSocket_ = socket(AF_INET6, SOCK_DGRAM, IPPROTO_UDP);
     if (udpSocket_ == INVALID_SOCKET) throw std::runtime_error("UDP socket failed");
 
-    sockaddr_in addr{};
-    addr.sin_family = AF_INET;
-    addr.sin_port = htons(cfg_.udpPort);
-    addr.sin_addr.s_addr = INADDR_ANY;
+    int off = 0;
+    setsockopt(udpSocket_, IPPROTO_IPV6, IPV6_V6ONLY, (char*)&off, sizeof(off));
 
-    if (bind(udpSocket_, (sockaddr*)&addr, sizeof(addr)) == SOCKET_ERROR)
+    sockaddr_in6 addr6{};
+    addr6.sin6_family = AF_INET6;
+    addr6.sin6_port = htons(cfg_.udpPort);
+    addr6.sin6_addr = in6addr_any;
+
+    if (bind(udpSocket_, (sockaddr*)&addr6, sizeof(addr6)) == SOCKET_ERROR)
         throw std::runtime_error("UDP bind failed");
 
     makeNonBlocking(udpSocket_);
     running_ = true;
     udpThread_ = std::thread([this] {
-        sockaddr_in from; int len = sizeof(from);
+        sockaddr_storage from_storage; int len = sizeof(from_storage);
         while (running_) {
-            // Use the member buffer directly
-            int bytes = recvfrom(udpSocket_, udpBuf, sizeof(udpBuf), 0, (sockaddr*)&from, &len);
-            if (bytes > 0) {
-                // Deserialize into the member packet object
+            int bytes = recvfrom(udpSocket_, udpBuf, sizeof(udpBuf), 0, (sockaddr*)&from_storage, &len);
+            if (bytes > 4) { // Must be at least 4 bytes for length
+                uint32_t netlen = 0;
+                std::memcpy(&netlen, udpBuf, 4);
+                uint32_t pktLen = ntohl(netlen);
+                if (bytes - 4 < (int)pktLen) continue; // Incomplete packet
+                std::string payload(udpBuf + 4, udpBuf + 4 + pktLen);
                 size_t consumed = 0;
-                if (Packet::deserialize(udpBuf, bytes, udpPkt, consumed)) {
+                if (Packet::deserialize(payload, udpPkt)) {
                     udpPkt.isTCP = false;
-                    std::lock_guard<std::mutex> lock(packetMutexUDP_);
-                    packetBufferUDP_.push_back(udpPkt);
+                    char buf[INET6_ADDRSTRLEN] = {};
+                    std::string ipStr;
+                    if (from_storage.ss_family == AF_INET) {
+                        sockaddr_in* from = (sockaddr_in*)&from_storage;
+                        inet_ntop(AF_INET, &from->sin_addr, buf, sizeof(buf));
+                        ipStr = buf;
+                    } else if (from_storage.ss_family == AF_INET6) {
+                        sockaddr_in6* from6 = (sockaddr_in6*)&from_storage;
+                        inet_ntop(AF_INET6, &from6->sin6_addr, buf, sizeof(buf));
+                        ipStr = buf;
+                    }
+                    udpPkt.peerIp = ipStr;
+                    // Whitelist/Blacklist check
+                    bool allowed = true;
+                    {
+                        std::lock_guard<std::mutex> lock(this->peersMutex_);
+                        if (this->cfg_.whitelisted) {
+                            allowed = this->whitelist_.count(ipStr) > 0 && this->blacklist_.count(ipStr) == 0;
+                        } else {
+                            allowed = this->blacklist_.count(ipStr) == 0;
+                        }
+                    }
+                    if (!allowed) continue;
+                    {
+                        std::lock_guard<std::mutex> lock(this->packetMutexUDP_);
+                        this->packetBufferUDP_.push_back(udpPkt);
+                    }
+                    std::vector<Packet> singlePacket{ udpPkt };
+                    this->WhenReceiveUDP(singlePacket);
 
-                    // add unknown peer
-                    static std::string key = addrToKey(from);
-                    std::lock_guard<std::mutex> lockPeers(peersMutex_);
-                    if (peers_.find(key) == peers_.end()) {
-                        Peer p; p.addr = from; p.socket = udpSocket_;
-                        peers_[key] = p;
+                    static std::string key = this->addrToKey(*(sockaddr_in*)&from_storage); // fallback for peer map
+                    std::lock_guard<std::mutex> lockPeers(this->peersMutex_);
+                    if (this->peers_.find(key) == this->peers_.end()) {
+                        Peer p; p.addr = *(sockaddr_in*)&from_storage; p.socket = this->udpSocket_;
+                        this->peers_[key] = p;
                     }
                 }
             }
@@ -309,15 +374,18 @@ inline void TwentyFiveNetwork::startUDP() {
 // ---------------------- startTCP ----------------------
 inline void TwentyFiveNetwork::startTCP() {
     if (cfg_.tcpPort <= 0) return;
-    tcpSocket_ = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+    tcpSocket_ = socket(AF_INET6, SOCK_STREAM, IPPROTO_TCP);
     if (tcpSocket_ == INVALID_SOCKET) throw std::runtime_error("TCP socket failed");
 
-    sockaddr_in addr{};
-    addr.sin_family = AF_INET;
-    addr.sin_port = htons(cfg_.tcpPort);
-    addr.sin_addr.s_addr = INADDR_ANY;
+    int off = 0;
+    setsockopt(tcpSocket_, IPPROTO_IPV6, IPV6_V6ONLY, (char*)&off, sizeof(off));
 
-    if (bind(tcpSocket_, (sockaddr*)&addr, sizeof(addr)) == SOCKET_ERROR)
+    sockaddr_in6 addr6{};
+    addr6.sin6_family = AF_INET6;
+    addr6.sin6_port = htons(cfg_.tcpPort);
+    addr6.sin6_addr = in6addr_any;
+
+    if (bind(tcpSocket_, (sockaddr*)&addr6, sizeof(addr6)) == SOCKET_ERROR)
         throw std::runtime_error("TCP bind failed");
 
     if (listen(tcpSocket_, SOMAXCONN) == SOCKET_ERROR)
@@ -328,51 +396,99 @@ inline void TwentyFiveNetwork::startTCP() {
 
     tcpThread_ = std::thread([this] {
         while (running_) {
-            SOCKET clientSock = accept(tcpSocket_, nullptr, nullptr);
+            sockaddr_storage peer_storage; int len = sizeof(peer_storage);
+            SOCKET clientSock = accept(tcpSocket_, (sockaddr*)&peer_storage, &len);
             if (clientSock != INVALID_SOCKET) {
                 makeNonBlocking(clientSock);
-                sockaddr_in peerAddr{};
-                int len = sizeof(peerAddr);
-                getpeername(clientSock, (sockaddr*)&peerAddr, &len);
-                std::string key = addrToKey(peerAddr);
+                std::string key;
+                char buf[INET6_ADDRSTRLEN] = {};
+                if (peer_storage.ss_family == AF_INET) {
+                    sockaddr_in* peerAddr = (sockaddr_in*)&peer_storage;
+                    key = addrToKey(*peerAddr);
+                } else if (peer_storage.ss_family == AF_INET6) {
+                    sockaddr_in6* peerAddr6 = (sockaddr_in6*)&peer_storage;
+                    inet_ntop(AF_INET6, &peerAddr6->sin6_addr, buf, sizeof(buf));
+                    key = std::string(buf) + ":" + std::to_string(ntohs(peerAddr6->sin6_port));
+                }
 
-                // Add a new entry for this connection. The map allocates the buffer and packet.
                 {
                     std::lock_guard<std::mutex> lock(tcpConnectionsMutex_);
                     tcpConnections[clientSock] = TcpConnectionData();
                 }
 
-                // Add peer to the shared list
                 std::lock_guard<std::mutex> peersLock(peersMutex_);
-                peers_[key] = Peer{ peerAddr, clientSock, true };
+                if (peer_storage.ss_family == AF_INET) {
+                    peers_[key] = Peer{ *(sockaddr_in*)&peer_storage, clientSock, true };
+                } else if (peer_storage.ss_family == AF_INET6) {
+                    sockaddr_in6* peerAddr6 = (sockaddr_in6*)&peer_storage;
+                    sockaddr_in peerAddr4{};
+                    peerAddr4.sin_family = AF_INET;
+                    peerAddr4.sin_addr.s_addr = 0;
+                    peerAddr4.sin_port = peerAddr6->sin6_port;
+                    peers_[key] = Peer{ peerAddr4, clientSock, true };
+                }
 
-                std::thread([this, clientSock, key] {
-                    // Get a reference to this connection's data. This must be a new variable
-                    // because the connection data could be erased by another thread.
+                std::thread([this, clientSock, key, peer_storage] {
                     TcpConnectionData* connData = nullptr;
                     {
-                        std::lock_guard<std::mutex> lock(tcpConnectionsMutex_);
-                        auto it = tcpConnections.find(clientSock);
-                        if (it != tcpConnections.end()) {
+                        std::lock_guard<std::mutex> lock(this->tcpConnectionsMutex_);
+                        auto it = this->tcpConnections.find(clientSock);
+                        if (it != this->tcpConnections.end()) {
                             connData = &it->second;
                         }
                     }
 
-                    while (running_ && connData) {
-                        int bytes = recv(clientSock, connData->buf, sizeof(connData->buf), 0);
-
+                    std::vector<char> tcpBuffer;
+                    while (this->running_ && connData) {
+                        char tempBuf[1024];
+                        int bytes = recv(clientSock, tempBuf, sizeof(tempBuf), 0);
                         if (bytes > 0) {
-                            // Add received data to the ring buffer
-                            connData->ringBuffer.write(connData->buf, bytes);
-
-                            // Process complete packets from the ring buffer
-                            Packet tempPkt;
-                            size_t consumed = 0;
-                            while (Packet::deserialize(connData->ringBuffer.buffer.data() + connData->ringBuffer.read_idx, connData->ringBuffer.size(), tempPkt, consumed)) {
-                                tempPkt.isTCP = true;
-                                std::lock_guard<std::mutex> lock(packetMutexTCP_);
-                                packetBufferTCP_.push_back(tempPkt);
-                                connData->ringBuffer.advance(consumed);
+                            tcpBuffer.insert(tcpBuffer.end(), tempBuf, tempBuf + bytes);
+                            // Process all complete packets in the buffer
+                            while (tcpBuffer.size() >= 4) {
+                                uint32_t netlen = 0;
+                                std::memcpy(&netlen, tcpBuffer.data(), 4);
+                                uint32_t pktLen = ntohl(netlen);
+                                if (tcpBuffer.size() < 4 + pktLen) break; // Wait for full packet
+                                std::string payload(tcpBuffer.begin() + 4, tcpBuffer.begin() + 4 + pktLen);
+                                Packet tempPkt;
+                                size_t consumed = 0;
+                                if (Packet::deserialize(payload, tempPkt)) {
+                                    tempPkt.isTCP = true;
+                                    char buf[INET6_ADDRSTRLEN] = {};
+                                    std::string ipStr;
+                                    if (peer_storage.ss_family == AF_INET) {
+                                        sockaddr_in* peerAddr = (sockaddr_in*)&peer_storage;
+                                        inet_ntop(AF_INET, &peerAddr->sin_addr, buf, sizeof(buf));
+                                        ipStr = buf;
+                                    } else if (peer_storage.ss_family == AF_INET6) {
+                                        sockaddr_in6* peerAddr6 = (sockaddr_in6*)&peer_storage;
+                                        inet_ntop(AF_INET6, &peerAddr6->sin6_addr, buf, sizeof(buf));
+                                        ipStr = buf;
+                                    }
+                                    tempPkt.peerIp = ipStr;
+                                    // Whitelist/Blacklist check
+                                    bool allowed = true;
+                                    {
+                                        std::lock_guard<std::mutex> lock(this->peersMutex_);
+                                        if (this->cfg_.whitelisted) {
+                                            allowed = this->whitelist_.count(ipStr) > 0 && this->blacklist_.count(ipStr) == 0;
+                                        } else {
+                                            allowed = this->blacklist_.count(ipStr) == 0;
+                                        }
+                                    }
+                                    if (!allowed) {
+                                        tcpBuffer.erase(tcpBuffer.begin(), tcpBuffer.begin() + 4 + pktLen);
+                                        continue;
+                                    }
+                                    {
+                                        std::lock_guard<std::mutex> lock(this->packetMutexTCP_);
+                                        this->packetBufferTCP_.push_back(tempPkt);
+                                    }
+                                    std::vector<Packet> singlePacket{ tempPkt };
+                                    this->WhenReceiveTCP(singlePacket);
+                                }
+                                tcpBuffer.erase(tcpBuffer.begin(), tcpBuffer.begin() + 4 + pktLen);
                             }
                         }
                         else if (bytes == 0 || WSAGetLastError() != WSAEWOULDBLOCK) {
@@ -382,18 +498,15 @@ inline void TwentyFiveNetwork::startTCP() {
                     }
 
                     closesocket(clientSock);
-
-                    // Clean up resources for this connection
-                    std::lock_guard<std::mutex> peersLock(peersMutex_);
-                    peers_.erase(key);
-                    std::lock_guard<std::mutex> dataLock(tcpConnectionsMutex_);
-                    tcpConnections.erase(clientSock);
-
-                    }).detach();
+                    std::lock_guard<std::mutex> peersLock(this->peersMutex_);
+                    this->peers_.erase(key);
+                    std::lock_guard<std::mutex> dataLock(this->tcpConnectionsMutex_);
+                    this->tcpConnections.erase(clientSock);
+                }).detach();
             }
             std::this_thread::sleep_for(std::chrono::milliseconds(1));
         }
-        });
+    });
 
     if (!tickThread_.joinable())
         tickThread_ = std::thread(&TwentyFiveNetwork::tickLoop, this);
