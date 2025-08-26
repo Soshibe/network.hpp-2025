@@ -1,98 +1,107 @@
 #include "network.hpp"
+#include <iostream>
 #include <thread>
 #include <chrono>
-#include <iostream>
+#include <unordered_map>
+#include <windows.h> // for GetAsyncKeyState
 
-// ---------------- SERVER ----------------
 class ServerNetwork : public TwentyFiveNetwork {
 public:
-    using TwentyFiveNetwork::TwentyFiveNetwork;
+    ServerNetwork(const Config& cfg) : TwentyFiveNetwork(cfg), tickCount(0) {}
 
 protected:
-    void handleUDPMessage(const std::string& msg, const sockaddr_in& from, long driftMs) override {
-        std::cout << "[Server] Got message: " << msg
-            << " (drift=" << driftMs << "ms)\n";
+    int tickCount;
 
-        // Echo back
-        std::string key = addrToKey(from);
-        sendUDPMessage("Echo: " + msg, key);
+    void WhenReceiveUDP(std::vector<Packet>& packets) override {
+        if (!packets.empty()) {
+            std::cout << "[Server] Tick " << tickCount << " received UDP packets:\n";
+            for (auto& pkt : packets) {
+                int val;
+                unpack(pkt, val);
+                std::cout << "  Object " << pkt.objectId << " " << pkt.varName << "=" << val << "\n";
+            }
+        }
     }
 
-    void onUDPTick() override {
-        // Server tick logic
+    void WhenReceiveTCP(std::vector<Packet>& packets) override {
+        if (!packets.empty()) {
+            std::cout << "[Server] Tick " << tickCount << " received TCP packets:\n";
+            for (auto& pkt : packets) {
+                int val;
+                unpack(pkt, val);
+                std::cout << "  Object " << pkt.objectId << " " << pkt.varName << "=" << val << "\n";
+            }
+        }
     }
+
+    void onUDPTick() override { tickCount++; }
 };
 
-// ---------------- CLIENT ----------------
 class ClientNetwork : public TwentyFiveNetwork {
 public:
-    using TwentyFiveNetwork::TwentyFiveNetwork;
+    ClientNetwork(const Config& cfg) : TwentyFiveNetwork(cfg) {}
 
-    void connectToServer(const std::string& host, int port) {
-        sockaddr_in server{};
-        server.sin_family = AF_INET;
-        server.sin_port = htons(port);
-        inet_pton(AF_INET, host.c_str(), &server.sin_addr);
-
-        serverKey_ = addrToKey(server);
-        {
-            std::lock_guard<std::mutex> lock(peersMutex_);
-            peers_[serverKey_] = Peer{
-                std::chrono::steady_clock::now(),
-                std::chrono::steady_clock::now(),
-                server
-            };
-        }
+    void sendKey(uint64_t objId, const std::string& keyVar, int value, bool tcp = false) {
+        packetize(objId, keyVar, value, tcp);
     }
-
-    void sendTestMessage(const std::string& text) {
-        if (!serverKey_.empty()) {
-            sendUDPMessage(text, serverKey_);
-        }
-    }
-
-protected:
-    void handleUDPMessage(const std::string& msg, const sockaddr_in& from, long driftMs) override {
-        std::cout << "[Client] Got reply: " << msg
-            << " (drift=" << driftMs << "ms)\n";
-    }
-
-private:
-    std::string serverKey_;
 };
 
-// ---------------- MAIN ----------------
 int main() {
-    // Config for server and client
-    TwentyFiveNetwork::Config serverCfg;
-    serverCfg.udpPort = 5000; // server listens on 5000
-    serverCfg.tickRate = 10;
-
-    TwentyFiveNetwork::Config clientCfg;
-    clientCfg.udpPort = 5001; // client listens on 5001
-    clientCfg.tickRate = 10;
-
+    // Server setup
+    ServerNetwork::Config serverCfg;
+    serverCfg.udpPort = 5000;
+    serverCfg.tcpPort = 5001;
     ServerNetwork server(serverCfg);
+    server.startUDP();
+    server.startTCP();
+    std::cout << "Server started.\n";
+
+    // Client setup
+    std::this_thread::sleep_for(std::chrono::seconds(1));
+    ClientNetwork::Config clientCfg;
     ClientNetwork client(clientCfg);
+    client.TCPConnect("127.0.0.1", 5001, 6001);
+    client.UDPConnect("127.0.0.1", 5000, 6000);
+    std::cout << "Client connected.\n";
 
-    // Start both
-    server.start();
-    client.start();
+    struct KeyState {
+        bool lastDown = false; // previous tick state
+    };
 
-    // Delay before connecting
-    std::this_thread::sleep_for(std::chrono::seconds(1));
-    client.connectToServer("127.0.0.1", serverCfg.udpPort);
+    std::unordered_map<int, KeyState> keys = {
+        { 'K', KeyState{} }, // Object 1 key
+        { 'J', KeyState{} }  // Object 2 key
+    };
 
-    // Send test message
-    std::this_thread::sleep_for(std::chrono::seconds(1));
-    client.sendTestMessage("Hello from Client!");
+    bool running = true;
+    while (running) {
+        if (GetAsyncKeyState(VK_ESCAPE) & 0x8000) { // ESC to quit
+            running = false;
+            break;
+        }
 
-    // Let them talk a bit
-    std::this_thread::sleep_for(std::chrono::seconds(5));
+        for (auto& [vk, state] : keys) {
+            bool currentlyDown = GetAsyncKeyState(vk) & 0x8000;
+            uint64_t objId = (vk == 'K') ? 1 : 2;
 
-    // Stop everything
-    client.stop();
-    server.stop();
+            if (currentlyDown && !state.lastDown) {
+                // Keydown event
+                client.sendKey(objId, "keydown", 1);
+                std::cout << "[Client] Sent keydown for " << char(vk) << "\n";
+            }
+            else if (!currentlyDown && state.lastDown) {
+                // Keyup event
+                client.sendKey(objId, "keyup", 1);
+                std::cout << "[Client] Sent keyup for " << char(vk) << "\n";
+            }
 
+            state.lastDown = currentlyDown;
+        }
+
+        std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    }
+
+    client.stopNetwork();
+    server.stopNetwork();
     return 0;
 }
